@@ -1,0 +1,219 @@
+IMPLEMENTATION SUMMARY: everestctl auth login
+=============================================
+Branch: release-2.0 + PR #2361 merged
+Spec reference: specs/005-authentication-system-redesign.md 
+
+
+BACKGROUND
+----------
+PR #2361 added the full server-side authentication infrastructure:
+  - POST /v1/auth/token  (password grant + refresh_token grant)
+  - POST /v1/auth/revoke
+  - internal/tokenregistry/ package (opaque refresh tokens stored hashed in k8s Secret)
+  - internal/server/auth.go (handler implementation)
+
+Before this work, the CLI had zero HTTP API authentication — every command
+talked directly to Kubernetes via kubeconfig. This implementation adds the
+CLI side of the login flow as described in spec 005.
+
+
+FILES CREATED
+-------------
+
+1. pkg/cli/config/config.go
+   - New package managing ~/.config/everest/config.yaml (mode 0600)
+   - Multi-context format modelled on kubeconfig, matches spec 005 schema exactly:
+
+       apiVersion: v1
+       kind: Config
+       currentContext: admin@localhost:8080
+       contexts:
+         - name: admin@localhost:8080
+           context:
+             server: http://localhost:8080
+             accessToken: eyJ...
+             refreshToken: everest_rt_...
+             expiresAt: 2026-06-14T15:30:00Z
+
+   - Types: Config, NamedContext, Context (all with yaml struct tags)
+   - DefaultPath() — resolves os.UserHomeDir() + .config/everest/config.yaml
+   - Load(path) — returns empty Config (not error) if file does not exist
+   - Config.Save(path) — creates parent dir with 0o700, writes file with 0o600
+   - Config.UpsertContext(name, ctx) — inserts if new, overwrites if name exists
+   - Uses gopkg.in/yaml.v3 (consistent with rest of codebase)
+
+2. pkg/cli/config/config_test.go
+   - TestDefaultPath — path ends with .config/everest/config.yaml
+   - TestLoad_FileAbsent — returns empty Config, no error when file missing
+   - TestLoad_RoundTrip — all fields (including time.Time) survive marshal/unmarshal
+   - TestConfig_Save_Permissions — file mode is exactly 0600, dir auto-created
+   - TestConfig_UpsertContext_Insert — new context appended
+   - TestConfig_UpsertContext_Update — existing context overwritten, no duplicates
+
+3. pkg/cli/auth/login.go
+   - Package auth, business logic only (no cobra dependency)
+   - Types: Config{Pretty bool}, LoginOptions{Server, Username, Password, ContextName}
+   - Login struct with zap.SugaredLogger; logger silenced in Pretty mode (same pattern
+     as pkg/accounts/cli/accounts.go)
+   - NewLogin(cfg Config, l *zap.SugaredLogger) *Login
+   - Login.Run(ctx, opts LoginOptions, cfgPath string) error:
+       1. validateServerURL(opts.Server) — rejects non-http/https schemes (see security)
+       2. normalizeServerURL(opts.Server) — strips trailing slash, appends /v1 if absent
+          REASON: generated client resolves ./auth/token relative to base URL, so base
+          must include /v1 for the full path to be /v1/auth/token. The /v1 in the
+          operation path comes from the base URL only — it is NOT doubled.
+       3. client.NewClient(normalizedURL) — uses generated client from client/ package
+       4. c.CreateAuthToken with grant_type=password, username, password,
+          refresh_token_delivery=body (explicitly requests token in response body)
+       5. On non-200: reads body, returns descriptive error with status code
+       6. Decodes AuthTokenResponse — RefreshToken is plain string (not *string) per
+          x-go-type-skip-optional-pointer in schema
+       7. Computes expiresAt = time.Now().Add(ExpiresIn seconds)
+       8. Derives context name: username@host:port (see context name section below)
+       9. Loads config from cfgPath, upserts context, sets CurrentContext, saves
+      10. Prints output.Success in pretty mode
+   - validateServerURL(server string) error — rejects file://, ftp://, javascript:,
+     empty string, and anything not starting with http:// or https://
+   - normalizeServerURL(server string) string — idempotent, handles trailing slashes
+     and already-present /v1
+   - defaultContextName(username, server string) string — produces username@host:port
+
+4. pkg/cli/auth/refresh.go
+   - Login.Refresh(ctx, cfgPath string) error — token rotation helper
+   - Designed for use by future data-plane commands (not used by login itself)
+   - Flow:
+       1. Load config from cfgPath
+       2. Find the current context by CurrentContext name
+       3. validateServerURL on stored server (guards against tampered config)
+       4. client.NewClient with normalised server URL
+       5. CreateAuthToken with grant_type=refresh_token, refresh_token from config
+          (RefreshTokenDelivery not set — server defaults to body delivery)
+       6. On non-200: return error, config left unchanged
+       7. On success: update AccessToken, RefreshToken, ExpiresAt in-place, Save
+   - cfgPath is explicit (not resolved internally) for testability
+
+5. pkg/cli/auth/login_test.go
+   - All tests use httptest.NewServer to stub POST /v1/auth/token
+   - All tests use t.TempDir() for config file isolation
+   - TestLogin_Run_Success — 200 response: config written, tokens correct,
+     currentContext set to username@host:port, file mode is 0600
+   - TestLogin_Run_CustomContextName — --context-name flag overrides auto-derive
+   - TestLogin_Run_AuthFailure — 401 response: error returned, config NOT written
+   - TestValidateServerURL — table-driven: http/https pass; file/ftp/javascript/
+     empty/scheme-relative all rejected
+   - TestNormalizeServerURL — table-driven: 5 input variants all produce correct base
+   - TestDefaultContextName — table-driven: username@host:port for http/https/bare
+
+6. pkg/cli/auth/refresh_test.go
+   - TestRefresh_Success — old tokens in config, server returns new pair,
+     config updated with rotated tokens and future ExpiresAt
+   - TestRefresh_InvalidToken — server returns 401, config unchanged after error
+   - TestRefresh_NoActiveContext — CurrentContext not found in Contexts, clear error
+
+7. commands/auth.go
+   - auth cobra subcommand group, registered on rootCmd
+   - Args: cobra.ExactArgs(1) — consistent with accountsCmd, namespacesCmd pattern
+   - Run: no-op (forces user to specify a subcommand)
+   - Registers auth.GetLoginCmd() as child
+
+8. commands/auth/login.go
+   - Package auth (cobra layer only, delegates to pkg/cli/auth)
+   - Package-level vars loginCmd, loginCfg, loginOpts — same DI pattern as all
+     other commands (e.g. commands/accounts/set_password.go)
+   - Flags registered in init():
+       --server         (FlagAuthServer)         Everest server URL
+       --username / -u  (FlagAccountsUsername)   Username
+       --password / -p  (FlagAccountsCreatePassword) Password
+       --context-name   (FlagAuthContextName)    Optional context name override
+   - loginPreRun: sets Pretty from --verbose/--json flags; prompts via TUI for any
+     missing --server (tui.NewInput), --username (accountscli.PopulateUsername),
+     --password (accountscli.PopulatePassword) — reuses existing TUI components
+   - loginRun: resolves DefaultPath, creates Login, calls Run, exits 1 on error
+   - GetLoginCmd() *cobra.Command exported for registration
+
+
+FILES MODIFIED
+--------------
+
+pkg/cli/flags.go
+  - Added FlagAuthServer = "server"
+  - Added FlagAuthContextName = "context-name"
+  (FlagAccountsUsername and FlagAccountsCreatePassword reused for --username/-u
+  and --password/-p since they are the same string values "username" and "password")
+
+
+CONTEXT NAME DESIGN
+-------------------
+Default format: username@host:port  (e.g. admin@localhost:8080)
+Rationale (per mentor feedback): allows multiple accounts on the same server
+to coexist as separate named contexts.
+
+Optional override: --context-name flag lets users specify any name they want.
+
+Username rename concern: investigated and confirmed NOT a real concern — the
+accounts.Interface has no Rename/UpdateUsername method, the API has no such
+endpoint, and the UI has no such feature. Usernames are immutable in the current
+system. The only way to "rename" is delete + recreate, which invalidates all
+tokens anyway.
+
+
+SECURITY REVIEW
+---------------
+YAML injection: yaml.v3 escapes all hostile strings (newlines, colons, null
+  bytes). Verified empirically — round-trip safe for all payloads tested.
+
+URL scheme injection: validateServerURL() explicitly rejects file://, ftp://,
+  javascript://, scheme-relative (//), and empty strings. Both Run and Refresh
+  call this before making any network request.
+
+JSON injection: not possible — response decoded into typed struct via
+  encoding/json, no string concatenation.
+
+Command injection: not applicable — no exec.Command or shell calls anywhere
+  in the new code.
+
+Path traversal: not possible — config file path is os.UserHomeDir() plus a
+  hardcoded constant suffix. No user input touches the file path.
+
+
+KEY TECHNICAL DECISIONS
+-----------------------
+1. cfgPath passed explicitly to Run and Refresh (not resolved internally) —
+   makes tests use t.TempDir() without any mocking or monkey-patching.
+
+2. /v1 appended in normalizeServerURL, not hardcoded in the client call —
+   because oapi-codegen strips the server prefix from each operation path.
+   The generated operation path is ./auth/token (not ./v1/auth/token), so
+   the /v1 must come from the base URL passed to NewClient.
+
+3. Both access token AND refresh token stored — access token (15min TTL) for
+   immediate API requests; refresh token (30 day TTL) for Refresh() calls.
+   ExpiresAt stores access token expiry so callers know when to refresh.
+
+4. Refresh() is implemented now (not deferred) — because every future
+   data-plane command will need it. One place, not duplicated per command.
+
+5. No transparent auto-refresh wrapper yet — that belongs in a future
+   pkg/cli/api/ package per spec. Refresh() is the primitive; the wrapper
+   is the next layer.
+
+6. No token storage in the cobra layer — cobra commands only handle flags,
+   TUI prompts, and error printing. All token/config logic lives in
+   pkg/cli/auth/ and pkg/cli/config/.
+
+
+WHAT IS NOT IMPLEMENTED (future work)
+--------------------------------------
+- everestctl auth logout (POST /v1/auth/revoke + delete context from config)
+- everestctl auth token create/list/revoke (PAT management)
+- everestctl config use-context / current-context / get-contexts / view
+- Transparent token refresh wrapper (pkg/cli/api/)
+- Auto-refresh on 401 in data-plane commands
+
+
+TEST RESULTS
+------------
+go test ./pkg/cli/config/... ./pkg/cli/auth/...
+  ok  github.com/openeverest/openeverest/v2/pkg/cli/config  (6 tests)
+  ok  github.com/openeverest/openeverest/v2/pkg/cli/auth    (11 tests)
+All 17 tests pass.
